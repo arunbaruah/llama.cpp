@@ -181,6 +181,22 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
+// TurboQuant (Zandieh et al., ICLR 2026): Walsh-Hadamard rotation + Lloyd-Max
+// scalar quantization, aimed at KV cache compression (not weight quantization).
+// Block size fixed at 128 to match common attention head_dim.
+#define QK_TURBO 128
+typedef struct {
+    ggml_half d;                 // block scale (RMS of rotated coords)
+    uint8_t   qs[(QK_TURBO * 3 + 7) / 8]; // packed 3-bit codebook indices
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + (QK_TURBO * 3 + 7) / 8, "wrong turbo3_0 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint8_t   qs[QK_TURBO / 2];  // packed 4-bit codebook indices (nibbles)
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO / 2, "wrong turbo4_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

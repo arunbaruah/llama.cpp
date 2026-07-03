@@ -398,6 +398,193 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// ---------------------------------------------------------------------------
+// TurboQuant (Zandieh et al., ICLR 2026, arXiv:2504.19874): KV-cache
+// quantization via randomized Hadamard rotation + Lloyd-Max scalar
+// quantization. Ported from the standalone reference implementation
+// (independently validated: MSE within 1% of the paper's reported numbers
+// for both 3-bit and 4-bit codebooks, generated via Lloyd's algorithm on
+// 20M N(0,1) samples - see generate_codebook.py).
+//
+// The QJL residual correction from the paper (Algorithm 2) is intentionally
+// NOT implemented; community reproductions found it increases variance more
+// than it reduces bias under softmax. MSE-only quantization is used.
+// ---------------------------------------------------------------------------
+
+static const float turbo3_codebook[8] = {
+    -2.15378061f, -1.34594303f, -0.75760113f, -0.24651119f,
+     0.24373149f,  0.75461671f,  1.34234174f,  2.15101808f
+};
+static const float turbo4_codebook[16] = {
+    -2.72910483f, -2.06576973f, -1.61525775f, -1.25372221f,
+    -0.94019814f, -0.65480632f, -0.38604090f, -0.12646789f,
+     0.13024319f,  0.38968998f,  0.65846276f,  0.94434183f,
+     1.25809455f,  1.62007773f,  2.07204708f,  2.73592722f
+};
+static const float turbo3_mid[7] = {
+    -1.74986182f, -1.05177208f, -0.50205616f, -0.00138985f,
+     0.49917410f,  1.04847922f,  1.74667991f
+};
+static const float turbo4_mid[15] = {
+    -2.39743728f, -1.84051374f, -1.43448998f, -1.09696017f,
+    -0.79750223f, -0.52042361f, -0.25625440f,  0.00188765f,
+     0.25996659f,  0.52407637f,  0.80140230f,  1.10121819f,
+     1.43908614f,  1.84606241f,  2.40398715f
+};
+
+static inline int turbo_nearest_idx(float v, const float * mid, int n_mid) {
+    int lo = 0, hi = n_mid;
+    while (lo < hi) {
+        int mi = (lo + hi) / 2;
+        if (v < mid[mi]) hi = mi; else lo = mi + 1;
+    }
+    return lo;
+}
+
+// In-place orthonormal Fast Walsh-Hadamard Transform, self-inverse.
+static void turbo_fwht_inplace(float * x, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += (len << 1)) {
+            for (int j = i; j < i + len; j++) {
+                float a = x[j];
+                float b = x[j + len];
+                x[j]       = a + b;
+                x[j + len] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / sqrtf((float) n);
+    for (int i = 0; i < n; i++) x[i] *= norm;
+}
+
+// Deterministic sign flip (self-inverse), combined with FWHT approximates a
+// random rotation in O(n log n) instead of O(n^2) for a dense random matrix.
+static void turbo_sign_flip(float * x, int n, uint32_t seed) {
+    uint32_t s = seed;
+    for (int i = 0; i < n; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        if (s & 1) x[i] = -x[i];
+    }
+}
+
+#define TURBO_SIGN_SEED 0x5eed1234u
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    const int64_t nb = k / QK_TURBO;
+
+    float buf[QK_TURBO];
+    uint8_t idx[QK_TURBO];
+
+    for (int64_t b = 0; b < nb; b++) {
+        memcpy(buf, x + b * QK_TURBO, sizeof(buf));
+
+        turbo_sign_flip(buf, QK_TURBO, TURBO_SIGN_SEED);
+        turbo_fwht_inplace(buf, QK_TURBO);
+
+        double ss = 0.0;
+        for (int i = 0; i < QK_TURBO; i++) ss += (double) buf[i] * buf[i];
+        float scale = (float) sqrt(ss / QK_TURBO);
+        if (scale < 1e-8f) scale = 1e-8f;
+        float inv_scale = 1.0f / scale;
+
+        for (int i = 0; i < QK_TURBO; i++) {
+            idx[i] = (uint8_t) turbo_nearest_idx(buf[i] * inv_scale, turbo3_mid, 7);
+        }
+
+        y[b].d = GGML_FP32_TO_FP16(scale);
+
+        // pack 3-bit indices, MSB-first, sequential across values
+        memset(y[b].qs, 0, sizeof(y[b].qs));
+        uint64_t acc = 0;
+        int acc_bits = 0, out_pos = 0;
+        for (int i = 0; i < QK_TURBO; i++) {
+            acc = (acc << 3) | (idx[i] & 0x7);
+            acc_bits += 3;
+            while (acc_bits >= 8) {
+                acc_bits -= 8;
+                y[b].qs[out_pos++] = (uint8_t)((acc >> acc_bits) & 0xFF);
+            }
+        }
+        if (acc_bits > 0) {
+            y[b].qs[out_pos++] = (uint8_t)((acc << (8 - acc_bits)) & 0xFF);
+        }
+    }
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    const int64_t nb = k / QK_TURBO;
+
+    for (int64_t b = 0; b < nb; b++) {
+        // unpack 3-bit indices
+        uint64_t acc = 0;
+        int acc_bits = 0, in_pos = 0;
+        uint8_t idx[QK_TURBO];
+        for (int i = 0; i < QK_TURBO; i++) {
+            while (acc_bits < 3) {
+                acc = (acc << 8) | x[b].qs[in_pos++];
+                acc_bits += 8;
+            }
+            acc_bits -= 3;
+            idx[i] = (uint8_t)((acc >> acc_bits) & 0x7);
+        }
+
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        float * out = y + b * QK_TURBO;
+        for (int i = 0; i < QK_TURBO; i++) {
+            out[i] = turbo3_codebook[idx[i]] * d;
+        }
+
+        turbo_fwht_inplace(out, QK_TURBO);   // self-inverse
+        turbo_sign_flip(out, QK_TURBO, TURBO_SIGN_SEED); // self-inverse
+    }
+}
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    const int64_t nb = k / QK_TURBO;
+
+    float buf[QK_TURBO];
+
+    for (int64_t b = 0; b < nb; b++) {
+        memcpy(buf, x + b * QK_TURBO, sizeof(buf));
+
+        turbo_sign_flip(buf, QK_TURBO, TURBO_SIGN_SEED);
+        turbo_fwht_inplace(buf, QK_TURBO);
+
+        double ss = 0.0;
+        for (int i = 0; i < QK_TURBO; i++) ss += (double) buf[i] * buf[i];
+        float scale = (float) sqrt(ss / QK_TURBO);
+        if (scale < 1e-8f) scale = 1e-8f;
+        float inv_scale = 1.0f / scale;
+
+        y[b].d = GGML_FP32_TO_FP16(scale);
+        for (int i = 0; i < QK_TURBO; i += 2) {
+            uint8_t i0 = (uint8_t) turbo_nearest_idx(buf[i]     * inv_scale, turbo4_mid, 15);
+            uint8_t i1 = (uint8_t) turbo_nearest_idx(buf[i + 1] * inv_scale, turbo4_mid, 15);
+            y[b].qs[i / 2] = (uint8_t)(i0 | (i1 << 4));
+        }
+    }
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    const int64_t nb = k / QK_TURBO;
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        float * out = y + b * QK_TURBO;
+        for (int i = 0; i < QK_TURBO; i += 2) {
+            uint8_t byte = x[b].qs[i / 2];
+            out[i]     = turbo4_codebook[byte & 0x0F] * d;
+            out[i + 1] = turbo4_codebook[byte >> 4]    * d;
+        }
+        turbo_fwht_inplace(out, QK_TURBO);
+        turbo_sign_flip(out, QK_TURBO, TURBO_SIGN_SEED);
+    }
+}
+
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 

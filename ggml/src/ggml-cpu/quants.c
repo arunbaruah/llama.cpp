@@ -112,6 +112,18 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_turbo3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    block_turbo3_0 * GGML_RESTRICT y = vy;
+    quantize_row_turbo3_0_ref(x, y, k);
+}
+
+void quantize_row_turbo4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TURBO == 0);
+    block_turbo4_0 * GGML_RESTRICT y = vy;
+    quantize_row_turbo4_0_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -119,6 +131,70 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 }
 
 //===================================== Dot products =================================
+
+// TurboQuant: correctness-first vec_dot. Dequantizes both the K block (via
+// the same code path validated in ggml-quants.c) and the Q8_0-quantized
+// query block, then computes a plain float dot product. vec_dot_type=Q8_0
+// (not F32!) matches the convention every other quantized type uses here -
+// production code and this file's own test harness allocate query-side
+// buffers sized for compact quantized types, not raw F32. Using F32 as
+// vec_dot_type caused a real buffer overflow (query buffer sized for
+// <=2 bytes/element, F32 needs 4) - caught via AddressSanitizer while
+// debugging a "double free or corruption" crash in test-quantize-fns.
+// NOT SIMD-optimized; this trades speed for a working, correct baseline.
+void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TURBO == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_turbo3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0     * GGML_RESTRICT y = vy;
+    const int nb = n / QK_TURBO;
+
+    GGML_ASSERT(QK_TURBO % QK8_0 == 0);
+    const int q8_per_block = QK_TURBO / QK8_0;
+
+    float kbuf[QK_TURBO];
+    float qbuf[QK_TURBO];
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo3_0(&x[i], kbuf, QK_TURBO);
+        for (int j = 0; j < q8_per_block; j++) {
+            dequantize_row_q8_0(&y[i * q8_per_block + j], qbuf + j * QK8_0, QK8_0);
+        }
+        for (int j = 0; j < QK_TURBO; j++) {
+            sumf += kbuf[j] * qbuf[j];
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TURBO == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_turbo4_0 * GGML_RESTRICT x = vx;
+    const block_q8_0     * GGML_RESTRICT y = vy;
+    const int nb = n / QK_TURBO;
+
+    GGML_ASSERT(QK_TURBO % QK8_0 == 0);
+    const int q8_per_block = QK_TURBO / QK8_0;
+
+    float kbuf[QK_TURBO];
+    float qbuf[QK_TURBO];
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo4_0(&x[i], kbuf, QK_TURBO);
+        for (int j = 0; j < q8_per_block; j++) {
+            dequantize_row_q8_0(&y[i * q8_per_block + j], qbuf + j * QK8_0, QK8_0);
+        }
+        for (int j = 0; j < QK_TURBO; j++) {
+            sumf += kbuf[j] * qbuf[j];
+        }
+    }
+    *s = sumf;
+}
 
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;
