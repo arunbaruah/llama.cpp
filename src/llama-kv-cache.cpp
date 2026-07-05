@@ -227,11 +227,24 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        // TurboQuant (turbo3_0/turbo4_0) has no CUDA kernels yet (SET_ROWS, flash-attn) -
+        // only a CPU implementation. If we let these tensors land on a CUDA buffer here,
+        // ggml's scheduler can't route the op elsewhere later because the buffer is already
+        // pinned, and it hard-crashes ("pre-allocated tensor ... cannot run the operation")
+        // instead of falling back. So force CPU for these two types specifically, even when
+        // -ngl offloads everything else to GPU. Everything else (model matmuls) still runs
+        // on GPU; only this layer's K/V cache read/write happens on CPU.
+        const bool kv_type_needs_cpu =
+            type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+            type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+
+        if (offload && !kv_type_needs_cpu) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        } else if (offload && kv_type_needs_cpu) {
+            dev_name = "CPU (forced: TurboQuant has no CUDA kernel yet)";
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
