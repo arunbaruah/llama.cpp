@@ -1,5 +1,6 @@
 # llama.cpp
-## Implemented Google Quant Algorithm (CPU version as R&D)
+## Implemented TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate
+#### (CPU version as R&D)
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
